@@ -31,13 +31,22 @@ st.title("Bitcoin Damped-Oscillator Model Forecast")
 st.caption("Live daily update • Your original data + real-time BTC price")
 
 # ====================== DATA PULL ======================
-@st.cache_data(ttl=86400)  # 24 hours
+@st.cache_data(ttl=86400)
 def load_data():
+    # Load your CSV with proper separator and force numeric price
     df = pd.read_csv('BTC_All_graph_coinmarketcap.csv', sep=';')
+    
+    # Clean and convert price column to numeric
+    df['price'] = df['price'].astype(str).str.replace(',', '').str.strip()
+    df['price'] = pd.to_numeric(df['price'], errors='coerce')  # Convert to float, turn bad values to NaN
+    
+    # Drop any rows where price couldn't be converted
+    df = df.dropna(subset=['price'])
+    
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = df.sort_values('timestamp').reset_index(drop=True)
     
-    # Append latest BTC price
+    # Append latest real-time BTC price
     today = yf.download('BTC-USD', period='2d', interval='1d')['Close']
     latest_price = today.iloc[-1]
     latest_date = today.index[-1].date()
@@ -52,6 +61,9 @@ def load_data():
     return df
 
 df = load_data()
+
+# Now safely create log_price
+df['log_price'] = np.log10(df['price'])
 
 # ====================== MODEL FIT ======================
 genesis = pd.to_datetime('2009-01-01')
