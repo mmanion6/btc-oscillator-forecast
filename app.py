@@ -6,26 +6,42 @@ from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 
-st.set_page_config(page_title="BTC Damped Oscillator Forecast", layout="wide")
-st.title("🚀 Bitcoin Damped-Oscillator Model + 10-Year Forecast")
-st.caption("Live daily update • Powered by your original data + real-time price")
+# ====================== EMBED OPTIMIZATION ======================
+st.set_page_config(
+    page_title="BTC Oscillator Forecast",
+    layout="wide",
+    initial_sidebar_state="collapsed"  # hides sidebar
+)
+
+# Hide Streamlit default header, menu, and footer when embedded
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .stApp {padding-top: 0.5rem;}
+    .block-container {padding-top: 1rem; padding-bottom: 1rem;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
+st.title("Bitcoin Damped-Oscillator Model Forecast")
+st.caption("Live daily update • Your original data + real-time BTC price")
 
 # ====================== DATA PULL ======================
-@st.cache_data(ttl=86400)  # cache for 24 hours
+@st.cache_data(ttl=86400)  # 24 hours
 def load_data():
-    # Your original CSV
     df = pd.read_csv('BTC_All_graph_coinmarketcap.csv', sep=';')
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = df.sort_values('timestamp').reset_index(drop=True)
     
-    # Append today's latest price
+    # Append latest BTC price
     today = yf.download('BTC-USD', period='2d', interval='1d')['Close']
     latest_price = today.iloc[-1]
     latest_date = today.index[-1].date()
     
-    # Only add if newer than last row
     if df['timestamp'].max().date() < latest_date:
         new_row = pd.DataFrame({
             'timestamp': [pd.Timestamp(latest_date)],
@@ -90,7 +106,7 @@ for i in range(len(halving_list)-1):
     cagr_annotations.append((mid_date, f"{label1}–{label2}\n{cagr*100:.1f}% CAGR"))
 
 # ====================== CHART ======================
-fig, ax = plt.subplots(figsize=(16, 9))
+fig, ax = plt.subplots(figsize=(16, 9.5))
 
 ax.plot(df['timestamp'], df['price'], label='Actual BTC Price', color='red', linewidth=1.8)
 ax.plot(df['timestamp'], df['pred_price'], label='Damped Oscillator Fit', color='blue', linestyle='--', linewidth=2)
@@ -104,7 +120,7 @@ for d_str, _ in halving_list:
 
 ax.axvline(last_date, color='gray', linestyle=':', linewidth=2.5, label='Present')
 
-# Orange dots + labels
+# Orange dots for special dates
 special_dates = [('2027-03-28', 'Mar 28, 2027'), ('2028-10-20', 'Oct 20, 2028')]
 for date_str, short_label in special_dates:
     dt = pd.to_datetime(date_str)
@@ -116,7 +132,7 @@ for date_str, short_label in special_dates:
                 ha='center', va='bottom', fontsize=9.5, color='darkorange', rotation=90,
                 bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85))
 
-# New peaks (simplified)
+# Orange dots for new ATH peaks
 peak_dates = pd.date_range(last_date + pd.Timedelta(days=30), '2036-12-31', freq='D')
 peak_prices = 10 ** btc_damped_osc(((peak_dates - genesis).total_seconds() / (24*3600))/365.25, *popt)
 peaks_idx, _ = find_peaks(peak_prices, prominence=8000, distance=180)
@@ -133,10 +149,12 @@ for idx in peaks_idx:
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
 ax.set_yscale('log')
+
 def usd_formatter(x, pos):
     if x >= 1_000_000: return f'${x/1_000_000:.1f}M'
     elif x >= 10_000: return f'${x/1_000:.0f}K'
     return f'${x:.0f}'
+
 ax.yaxis.set_major_formatter(FuncFormatter(usd_formatter))
 
 ax.set_title('Bitcoin Damped-Oscillator Model + Long-Term Forecast', fontsize=16, pad=20)
@@ -144,7 +162,7 @@ ax.set_xlabel('Date')
 ax.set_ylabel('Bitcoin Price (USD)')
 ax.legend(fontsize=10.5, loc='lower right')
 
-# Equation (top-left)
+# Equation in top-left
 equation = r'$\log_{10}(P(t)) = a + b \cdot \ln(t) + A \cdot e^{-\gamma t} \cdot \sin(\omega t + \phi)$'
 ax.text(0.02, 0.96, equation, transform=ax.transAxes, fontsize=14, va='top', ha='left',
         bbox=dict(boxstyle="round,pad=0.8", facecolor="white", alpha=0.95, edgecolor="#1f77b4"))
@@ -156,7 +174,6 @@ for mid_date, text in cagr_annotations:
 
 ax.grid(True, which='both', linestyle='--', alpha=0.35)
 
-st.pyplot(fig)
+st.pyplot(fig, use_container_width=True)
 
-# Footer info
-st.caption(f"Last data point: {last_date.date()} | Model refitted daily | Cycle period ≈ {2*np.pi/omega:.2f} years")
+st.caption(f"Last updated: {datetime.now().strftime('%B %d, %Y')} | Model refitted daily | Cycle ≈ {2*np.pi/omega:.2f} years")
