@@ -30,33 +30,42 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 st.title("Bitcoin Damped-Oscillator Model Forecast")
 st.caption("Live daily update • Your original data + real-time BTC price")
 
-# ====================== DATA PULL ======================
+# ====================== DATA PULL & CLEANING ======================
 @st.cache_data(ttl=86400)
 def load_data():
-    # Load your CSV with proper separator and force numeric price
+    # Load CSV with semicolon separator
     df = pd.read_csv('BTC_All_graph_coinmarketcap.csv', sep=';')
     
-    # Clean and convert price column to numeric
-    df['price'] = df['price'].astype(str).str.replace(',', '').str.strip()
-    df['price'] = pd.to_numeric(df['price'], errors='coerce')  # Convert to float, turn bad values to NaN
+    # === CRITICAL CLEANING STEP ===
+    # Convert price column to numeric (handles commas, spaces, strings, etc.)
+    df['price'] = df['price'].astype(str) \
+                    .str.replace(',', '', regex=False) \
+                    .str.replace(' ', '', regex=False) \
+                    .str.strip()
     
-    # Drop any rows where price couldn't be converted
-    df = df.dropna(subset=['price'])
+    df['price'] = pd.to_numeric(df['price'], errors='coerce')
     
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df.sort_values('timestamp').reset_index(drop=True)
+    # Drop any rows where price is invalid
+    df = df.dropna(subset=['price']).reset_index(drop=True)
     
-    # Append latest real-time BTC price
-    today = yf.download('BTC-USD', period='2d', interval='1d')['Close']
-    latest_price = today.iloc[-1]
-    latest_date = today.index[-1].date()
+    # Convert timestamp
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    df = df.dropna(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
     
-    if df['timestamp'].max().date() < latest_date:
-        new_row = pd.DataFrame({
-            'timestamp': [pd.Timestamp(latest_date)],
-            'price': [latest_price]
-        })
-        df = pd.concat([df, new_row], ignore_index=True)
+    # Append latest real-time BTC price from yfinance
+    try:
+        today = yf.download('BTC-USD', period='2d', interval='1d', progress=False)['Close']
+        latest_price = float(today.iloc[-1])
+        latest_date = today.index[-1].date()
+        
+        if df['timestamp'].max().date() < latest_date:
+            new_row = pd.DataFrame({
+                'timestamp': [pd.Timestamp(latest_date)],
+                'price': [latest_price]
+            })
+            df = pd.concat([df, new_row], ignore_index=True)
+    except:
+        pass  # if yfinance fails, continue with existing data
     
     return df
 
