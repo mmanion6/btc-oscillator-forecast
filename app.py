@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
@@ -16,7 +15,7 @@ st.markdown(hide, unsafe_allow_html=True)
 st.title("Bitcoin Damped-Oscillator Model — Full Cycle History & Forecast (2012–2040)")
 st.caption("Live daily update • Buy / Consolidation / ATH Zones")
 
-# Data
+# Load data
 @st.cache_data(ttl=86400)
 def load_data():
     df = pd.read_csv('BTC_All_graph_coinmarketcap.csv', sep=';')
@@ -47,7 +46,7 @@ def btc_damped_osc(t, a, b, A, gamma, omega, phi):
 popt, _ = curve_fit(btc_damped_osc, df['t'], df['log_price'], p0=[-18, 1.15, 0.5, 0.05, 1.57, 0], maxfev=5000)
 a, b, A, gamma, omega, phi = popt
 
-# Unified timeline 2012-2040
+# Unified timeline
 chart_start = pd.to_datetime('2012-01-01')
 chart_end = pd.to_datetime('2040-12-31')
 all_dates = pd.date_range(chart_start, chart_end, freq='D')
@@ -73,11 +72,10 @@ all_df['regime'] = np.where(all_df['osc'] < -thresh, 'buy',
 # Chart
 fig, ax = plt.subplots(figsize=(22, 12))
 
-# Background shading
-regime_colors = {'buy': '#d4f4d4', 'consolidation': '#e0f0ff', 'ath': '#ffe6cc'}
-for regime, color in regime_colors.items():
+# Vertical regime background shading (this is what you want)
+for regime, color in {'buy': '#d4f4d4', 'consolidation': '#e0f0ff', 'ath': '#ffe6cc'}.items():
     mask = all_df['regime'] == regime
-    ax.fill_between(all_df['timestamp'], 5, all_df['pred_price']*1.5, where=mask, color=color, alpha=0.6, zorder=1)
+    ax.fill_between(all_df['timestamp'], 3, all_df['pred_price']*2, where=mask, color=color, alpha=0.75, zorder=1)
 
 # Actual price
 ax.plot(df['timestamp'], df['price'], color='crimson', linewidth=2.2, label='Actual BTC Price', zorder=6)
@@ -105,7 +103,7 @@ ax.axvline(df['timestamp'].max(), color='gray', linestyle=':', linewidth=3, labe
 for d in ['2012-11-28','2016-07-09','2020-05-11','2024-04-19','2028-04-20','2032-04-20']:
     ax.axvline(pd.to_datetime(d), color='purple', linestyle='--', alpha=0.6, linewidth=1.4)
 
-# **CAGR blocks at bottom**
+# CAGR boxes at bottom
 halving_list = [('2012-11-28','2012'), ('2016-07-09','2016'), ('2020-05-11','2020'),
                 ('2024-04-19','2024'), ('2028-04-20','2028'), ('2032-04-20','2032')]
 for i in range(len(halving_list)-1):
@@ -117,11 +115,11 @@ for i in range(len(halving_list)-1):
     p2 = 10 ** (a + b * np.log(t2))
     cagr = (p2 / p1) ** (1 / (t2 - t1)) - 1
     mid = s + (e - s)/2
-    ax.text(mid, 650, f"{halving_list[i][1]}–{halving_list[i+1][1]}\n{cagr*100:.1f}% CAGR",
+    ax.text(mid, 450, f"{halving_list[i][1]}–{halving_list[i+1][1]}\n{cagr*100:.1f}% CAGR",
             ha='center', va='bottom', fontsize=9, color='purple', fontweight='bold',
             bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.92, edgecolor='purple'))
 
-# Equation
+# Equation box
 eq = f"log₁₀(P(t)) = a + b · ln(t) + A · e^(-γt) · sin(ωt + φ)\na={a:.3f}, b={b:.3f}, A={A:.3f}, γ={gamma:.4f}, ω={omega:.4f}, φ={phi:.4f}"
 ax.text(0.02, 0.96, eq, transform=ax.transAxes, fontsize=10.5, va='top', ha='left',
         bbox=dict(boxstyle="round,pad=0.8", facecolor="white", alpha=0.95, edgecolor="#1f77b4"))
