@@ -149,4 +149,4 @@ ax.text(0.02, 0.96, eq, transform=ax.transAxes, fontsize=11, va='top', ha='left'
 
 st.pyplot(fig, use_container_width=True)
 
-st.caption(f"Last data: {df['timestamp'].max().date()} | Cycle
+st.caption(f"Last data: {df['timestamp'].max().date()} | Cycle ≈ {2*np.pi/omega:.2f} years | Updated daily")
