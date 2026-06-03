@@ -334,7 +334,7 @@ plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
 # Equation box
 equation = (
     r"$\log_{10}(P(t)) = a + b \cdot \ln(t) + A \cdot e^{-\gamma t} \cdot \sin(\omega t + \phi)$"
-    f"\n$a={a:.3f},\\ b={b:.3f},\\ A={A:.3f},\\ \\gamma={gamma:.4f},\\ \\omega={omega:.4f},\\ \\phi={phi:.4f}$"
+    f"\na={a:.3f}  b={b:.3f}  A={A:.3f}  γ={gamma:.4f}  ω={omega:.4f}  φ={phi:.4f}"
 )
 ax.text(0.01, 0.975, equation, transform=ax.transAxes,
         fontsize=10.5, va="top", ha="left", family="monospace",
