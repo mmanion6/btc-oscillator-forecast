@@ -1,398 +1,504 @@
-import streamlit as st
-import pandas as pd
+"""
+Bitcoin Power-Law Underdamped Staircase & Macro Oscillator Model (2012 to 2040)
+
+Run with:
+    streamlit run app.py
+
+Dependencies:
+    pip install streamlit matplotlib numpy pandas scipy yfinance
+"""
+
+from datetime import datetime
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
-from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
-import plotly.graph_objects as go
+import pandas as pd
+import streamlit as st
 import yfinance as yf
-from streamlit_autorefresh import st_autorefresh
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from scipy.optimize import curve_fit
 
-st.set_page_config(page_title="BTC Forecast", layout="wide", initial_sidebar_state="collapsed")
-st.markdown(
-    "<style>#MainMenu{visibility:hidden;}footer{visibility:hidden;}header{visibility:hidden;}</style>",
-    unsafe_allow_html=True,
-)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+GENESIS = pd.Timestamp("2009-01-03")
+DAYS_PER_YEAR = 365.25
+EPS = 1e-6
 
-# Auto-refresh every 60 seconds
-st_autorefresh(interval=60_000, key="btc_refresh")
+CIRCULATING_SUPPLY = 20_000_000          # ~20M BTC
+MARKET_CAP_CEILING = 10e12               # $10 Trillion hard cap
+PRICE_CEILING = MARKET_CAP_CEILING / CIRCULATING_SUPPLY   # ~$500,000 per BTC
+LOG_CEILING = np.log10(PRICE_CEILING)
 
-st.title("Bitcoin Damped-Oscillator Model — Full Cycle History & Forecast (2012–2040)")
-st.caption("Live data · auto-refreshes every 60 s · hover or drag to explore · scroll to zoom")
+PROJECTION_START = pd.Timestamp("2012-01-01")
+PROJECTION_END = pd.Timestamp("2040-12-31")
 
-# ── Pre-2014 history from CSV (static, cached 24h) ───────────────────────────
-CUTOVER = pd.Timestamp("2014-09-17")  # first date yfinance has BTC-USD
+PARAM_NAMES = ["a", "b", "step_h", "step_f", "sharp", "amp", "decay"]
+LOWER_BOUNDS = [-5, 0.1, 0.1, 3.5, 10, -2, 0]
+UPPER_BOUNDS = [5, 5, 2, 5.0, 60, 2, 5]
+P0 = [-1.0, 3.5, 0.8, 4.0, 20.0, 0.3, 0.5]
 
-@st.cache_data(ttl=86400)
-def load_csv_history():
-    df = pd.read_csv("BTC_All_graph_coinmarketcap.csv", sep=";")
-    df["price"] = pd.to_numeric(
-        df["price"].astype(str).str.replace(",", "").str.strip(), errors="coerce"
+ACTUAL_COLOR = "#DC143C"
+MODEL_COLOR = "black"
+SUPPORT_COLOR = "grey"
+CAGR_COLOR = "#6a0dad"
+ARROW_COLOR = "#00aa00"
+CONSOLIDATION_COLOR = "#4a90d9"
+EXPANSION_COLOR = "#ff8c00"
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+def dates_to_t(index: pd.DatetimeIndex) -> np.ndarray:
+    """Convert datetimes to fractional years since Genesis with epsilon offset."""
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    delta_days = (idx - GENESIS) / pd.Timedelta(days=1)
+    t = np.asarray(delta_days, dtype=float) / DAYS_PER_YEAR
+    return np.maximum(t, EPS)
+
+
+def t_to_date(t: float) -> pd.Timestamp:
+    """Convert fractional years since Genesis back to a Timestamp."""
+    return GENESIS + pd.to_timedelta(float(t) * DAYS_PER_YEAR, unit="D")
+
+
+# ---------------------------------------------------------------------------
+# Model mathematics
+# ---------------------------------------------------------------------------
+def model_log10(t, a, b, step_h, step_f, sharp, amp, decay):
+    """
+    log10(P(t)) = min( Trend + Staircase + Wobble, log10(CEILING) )
+
+    Trend     = a + b * log10(t)
+    Staircase = step_h * ( floor(t / step_f) + sigmoid(sharp * (phase - step_f / 2)) )
+    Wobble    = amp * exp(-decay * phase) * sin(2 * pi * phase / step_f)
+    phase     = t mod step_f
+    """
+    t = np.maximum(np.asarray(t, dtype=float), EPS)
+    phase = np.mod(t, step_f)
+
+    trend = a + b * np.log10(t)
+
+    sig_arg = np.clip(-sharp * (phase - step_f / 2.0), -500.0, 500.0)
+    staircase = step_h * (np.floor(t / step_f) + 1.0 / (1.0 + np.exp(sig_arg)))
+
+    wobble = amp * np.exp(-decay * phase) * np.sin(2.0 * np.pi * phase / step_f)
+
+    return np.minimum(trend + staircase + wobble, LOG_CEILING)
+
+
+def model_price(t, params) -> np.ndarray:
+    return 10.0 ** model_log10(t, *params)
+
+
+# ---------------------------------------------------------------------------
+# Data ingestion
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_btc_history() -> pd.DataFrame:
+    df = yf.download(
+        "BTC-USD",
+        period="max",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
     )
-    df = df.dropna(subset=["price"]).reset_index(drop=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    return df[df["timestamp"] < CUTOVER][["timestamp", "price"]].copy()
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-# ── 2014-present daily closes + today's live price (5-min cache) ─────────────
-@st.cache_data(ttl=300)
-def load_yf_data():
-    # Full daily history from yfinance
-    hist = yf.download("BTC-USD", period="max", interval="1d", progress=False, auto_adjust=True)
-    hist = hist[["Close"]].reset_index()
-    hist.columns = ["timestamp", "price"]
-    hist["timestamp"] = pd.to_datetime(hist["timestamp"]).dt.tz_localize(None)
-    hist["price"] = hist["price"].astype(float)
-    hist = hist.dropna().sort_values("timestamp").reset_index(drop=True)
+    # Strip multi-index column layers dynamically
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    # Today's intraday — get the freshest price available
-    live_price, live_ts = None, None
+    if "Close" not in df.columns:
+        return pd.DataFrame()
+
+    out = df[["Close"]].copy()
+    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
+    out = out.dropna()
+    out = out[out["Close"] > 0]
+    out.index = pd.to_datetime(out.index)
+    if out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Curve fitting
+# ---------------------------------------------------------------------------
+def fit_model(t: np.ndarray, log_price: np.ndarray):
+    """Fit the staircase model. Returns (params, success_flag, message)."""
     try:
-        intra = yf.download("BTC-USD", period="1d", interval="1m", progress=False, auto_adjust=True)
-        if not intra.empty:
-            live_price = float(intra["Close"].iloc[-1])
-            ts = intra.index[-1]
-            live_ts = ts.tz_localize(None) if ts.tzinfo else pd.Timestamp(ts)
-    except Exception:
-        pass
-
-    # Append live price if it's newer than the last daily bar
-    if live_price and live_ts and live_ts > hist["timestamp"].max():
-        hist = pd.concat(
-            [hist, pd.DataFrame({"timestamp": [live_ts], "price": [live_price]})],
-            ignore_index=True,
+        popt, _ = curve_fit(
+            model_log10,
+            t,
+            log_price,
+            p0=P0,
+            bounds=(LOWER_BOUNDS, UPPER_BOUNDS),
+            maxfev=20000,
         )
-        return hist, live_price, live_ts
+        if not np.all(np.isfinite(popt)):
+            raise ValueError("Non-finite parameters returned by optimizer.")
+        return popt, True, "Curve fit converged."
+    except Exception as exc:  # noqa: BLE001
+        return np.array(P0, dtype=float), False, f"Curve fit failed ({exc}); using default parameters."
 
-    return hist, live_price, hist["timestamp"].max()
 
-csv_df = load_csv_history()
-yf_df, live_price, live_ts = load_yf_data()
+def fit_quality(t: np.ndarray, log_price: np.ndarray, params) -> dict:
+    pred = model_log10(t, *params)
+    resid = log_price - pred
+    ss_res = float(np.sum(resid ** 2))
+    ss_tot = float(np.sum((log_price - np.mean(log_price)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    rmse = float(np.sqrt(np.mean(resid ** 2)))
+    return {"r2": r2, "rmse_log10": rmse}
 
-# Merge: CSV pre-2014 + yfinance 2014-now (drop overlap)
-df = pd.concat([csv_df, yf_df], ignore_index=True)
-df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
 
-last_date = df["timestamp"].max()
-genesis = pd.to_datetime("2009-01-01")
-df["t"] = (df["timestamp"] - genesis).dt.total_seconds() / (24 * 3600 * 365.25)
-df["log_price"] = np.log10(df["price"].astype(float))
+# ---------------------------------------------------------------------------
+# Phase / epoch construction
+# ---------------------------------------------------------------------------
+def build_phases(params, t_start: float, t_end: float, expansion_frac: float) -> list:
+    """
+    Construct alternating Consolidation / Expansion epochs.
 
-# ── Model ─────────────────────────────────────────────────────────────────────
-def btc_damped_osc(t, a, b, A, gamma, omega, phi):
-    return a + b * np.log(t) + A * np.exp(-gamma * t) * np.sin(omega * t + phi)
+    The Expansion epoch is centred on the sigmoid breakout (phase = step_f / 2)
+    and spans `expansion_frac` of the step period. Consolidation fills the rest
+    and wraps across the cycle boundary.
+    """
+    step_f = float(params[3])
+    half_exp = expansion_frac * step_f / 2.0
 
-def osc_component(t, A, gamma, omega, phi):
-    return A * np.exp(-gamma * t) * np.sin(omega * t + phi)
+    phases = []
+    k_min = int(np.floor(t_start / step_f)) - 1
+    k_max = int(np.ceil(t_end / step_f)) + 1
 
-popt, _ = curve_fit(
-    btc_damped_osc, df["t"], df["log_price"],
-    p0=[-18, 1.15, 0.5, 0.05, 1.57, 0], maxfev=5000,
-)
-a, b, A, gamma, omega, phi = popt
+    for k in range(k_min, k_max + 1):
+        centre = k * step_f + step_f / 2.0
+        exp_start = centre - half_exp
+        exp_end = centre + half_exp
+        next_exp_start = exp_start + step_f
 
-# ── Unified timeline ──────────────────────────────────────────────────────────
-chart_start = pd.to_datetime("2012-01-01")
-chart_end   = pd.to_datetime("2040-12-31")
-all_dates   = pd.date_range(chart_start, chart_end, freq="D")
-all_t       = ((all_dates - genesis).total_seconds() / (24 * 3600)) / 365.25
+        phases.append(("Expansion", exp_start, exp_end))
+        phases.append(("Consolidation", exp_end, next_exp_start))
 
-all_pred_price = 10 ** btc_damped_osc(all_t, *popt)
-all_osc        = osc_component(all_t, A, gamma, omega, phi)
-all_trend      = 10 ** (a + b * np.log(all_t))
-thresh         = 0.20 * np.abs(A * np.exp(-gamma * all_t))
+    # Clip to plotting window, drop empties, sort
+    clipped = []
+    for name, s, e in phases:
+        s_c, e_c = max(s, t_start), min(e, t_end)
+        if e_c - s_c > 1e-6:
+            clipped.append((name, s_c, e_c))
+    clipped.sort(key=lambda x: x[1])
+    return clipped
 
-all_df = pd.DataFrame({
-    "timestamp":  all_dates,
-    "pred_price": all_pred_price,
-    "osc":        all_osc,
-    "trend":      all_trend,
-    "is_hist":    all_dates <= last_date,
-})
-all_df["regime"] = np.where(
-    all_df["osc"] < -thresh, "buy",
-    np.where(all_df["osc"] > thresh, "ath", "consolidation"),
-)
 
-future_df = all_df[all_df["timestamp"] > last_date].copy().reset_index(drop=True)
+def annualized_cagr(p0: float, p1: float, years: float) -> float:
+    if p0 <= 0 or years <= 0:
+        return float("nan")
+    return (p1 / p0) ** (1.0 / years) - 1.0
 
-# ── Peak / trough detection ───────────────────────────────────────────────────
-hist_chart = df[df["timestamp"] >= chart_start].copy().reset_index(drop=True)
 
-peaks_idx, _ = find_peaks(hist_chart["price"].values,
-                           prominence=hist_chart["price"].values.max() * 0.10, distance=180)
-hist_aths = hist_chart.iloc[peaks_idx][["timestamp", "price"]].copy()
+def fmt_price(p: float) -> str:
+    if not np.isfinite(p):
+        return "n/a"
+    if p >= 1000:
+        return f"${p:,.0f}"
+    if p >= 1:
+        return f"${p:,.2f}"
+    return f"${p:,.4f}"
 
-trough_idx, _ = find_peaks(-hist_chart["price"].values,
-                            prominence=hist_chart["price"].values.max() * 0.02, distance=180)
-hist_lows = hist_chart.iloc[trough_idx][["timestamp", "price"]].copy()
-hist_lows = hist_lows[hist_lows["price"] < hist_chart["price"].max() * 0.50]
 
-analysis_start = pd.to_datetime("2026-04-08")
-fut_an = future_df[future_df["timestamp"] >= analysis_start].copy().reset_index(drop=True)
-fp_idx, _ = find_peaks(fut_an["osc"].values, prominence=0.05, distance=200)
-fut_aths = fut_an.iloc[fp_idx][["timestamp", "pred_price"]].copy()
-ft_idx, _ = find_peaks(-fut_an["osc"].values, prominence=0.05, distance=200)
-fut_lows = fut_an.iloc[ft_idx][["timestamp", "pred_price"]].copy()
+def currency_tick(v, _pos=None) -> str:
+    if v >= 1:
+        return f"${v:,.0f}"
+    return f"${v:g}"
 
-# ── Halvings ──────────────────────────────────────────────────────────────────
-halving_list = [
-    ("2012-11-28", "2012 Halving"),
-    ("2016-07-09", "2016 Halving"),
-    ("2020-05-11", "2020 Halving"),
-    ("2024-04-19", "2024 Halving"),
-    ("2028-04-20", "2028 Halving"),
-    ("2032-04-20", "2032 Halving"),
-    ("2036-04-19", "2036 Halving"),
-    ("2040-04-19", "2040 Halving"),
-]
 
-# ── Helper: price label ───────────────────────────────────────────────────────
-def plabel(p):
-    if p >= 1e6:  return f"${p/1e6:.2f}M"
-    if p >= 1e3:  return f"${p/1e3:.0f}K"
-    return f"${p:,.0f}"
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+def build_figure(hist: pd.DataFrame, params, support_discount: float, phases: list):
+    proj_dates = pd.date_range(PROJECTION_START, PROJECTION_END, freq="D")
+    t_proj = dates_to_t(proj_dates)
+    p_proj = model_price(t_proj, params)
+    p_support = p_proj * (1.0 - support_discount)
 
-# ── Build Plotly figure ───────────────────────────────────────────────────────
-fig = go.Figure()
+    fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
 
-# 1. Regime background bands
-regime_cfg = {
-    "buy":           ("Buy Zone",           "rgba(180,240,180,0.45)"),
-    "consolidation": ("Consolidation",      "rgba(180,210,255,0.40)"),
-    "ath":           ("ATH / Sell Zone",    "rgba(255,210,160,0.45)"),
-}
+    # Phase shading
+    for name, s, e in phases:
+        color = EXPANSION_COLOR if name == "Expansion" else CONSOLIDATION_COLOR
+        alpha = 0.18 if name == "Expansion" else 0.07
+        ax.axvspan(t_to_date(s), t_to_date(e), color=color, alpha=alpha, lw=0, zorder=0)
 
-for regime, (label, color) in regime_cfg.items():
-    mask = all_df["regime"] == regime
-    segs = all_df[mask].copy()
-    # Trace as a filled area by stacking y2=very high, y=very low
-    fig.add_trace(go.Scatter(
-        x=pd.concat([all_df["timestamp"][mask], all_df["timestamp"][mask].iloc[::-1]]),
-        y=[1e1] * mask.sum() + [1e9] * mask.sum(),
-        fill="toself",
-        fillcolor=color,
-        line=dict(width=0),
-        mode="none",
-        name=label,
-        legendgroup=regime,
-        showlegend=True,
-        hoverinfo="skip",
-    ))
-
-# 2. Regime-colored model fit lines (historical)
-line_cfg = {
-    "buy":           ("#00aa00", "dash"),
-    "consolidation": ("#1e90ff", "dot"),
-    "ath":           ("#e07000", "solid"),
-}
-label_hist = {
-    "buy": "Buy Zone — hist fit",
-    "consolidation": "Consolidation — hist fit",
-    "ath": "ATH/Sell — hist fit",
-}
-label_fut = {
-    "buy": "Buy Zone — forecast",
-    "consolidation": "Consolidation — forecast",
-    "ath": "ATH/Sell — forecast",
-}
-
-for regime, (color, dash) in line_cfg.items():
-    subsets = [
-        (all_df[all_df["is_hist"]],  2, label_hist[regime]),
-        (all_df[~all_df["is_hist"]], 3, label_fut[regime]),
-    ]
-    for subset, lw, lbl in subsets:
-        seg = subset[subset["regime"] == regime]
-        if seg.empty:
-            continue
-        hover = [
-            f"<b>{lbl}</b><br>Date: {d.strftime('%Y-%m-%d')}<br>Model: {plabel(p)}"
-            for d, p in zip(seg["timestamp"], seg["pred_price"])
-        ]
-        fig.add_trace(go.Scatter(
-            x=seg["timestamp"], y=seg["pred_price"],
-            mode="lines",
-            line=dict(color=color, width=lw, dash=dash),
-            name=lbl,
-            legendgroup=lbl,
-            showlegend=True,
-            hovertemplate="%{customdata}<extra></extra>",
-            customdata=hover,
-        ))
-
-# 3. Actual BTC price
-hist_plot = df[df["timestamp"] >= chart_start]
-hover_actual = [
-    f"<b>Actual BTC</b><br>Date: {d.strftime('%Y-%m-%d')}<br>Price: {plabel(p)}"
-    for d, p in zip(hist_plot["timestamp"], hist_plot["price"])
-]
-fig.add_trace(go.Scatter(
-    x=hist_plot["timestamp"], y=hist_plot["price"],
-    mode="lines",
-    line=dict(color="crimson", width=2),
-    name="Actual BTC Price",
-    hovertemplate="%{customdata}<extra></extra>",
-    customdata=hover_actual,
-))
-
-# 4. Pure log trend
-fig.add_trace(go.Scatter(
-    x=all_dates, y=all_trend,
-    mode="lines",
-    line=dict(color="navy", width=1.5, dash="dot"),
-    opacity=0.6,
-    name="Pure Log Trend",
-    hovertemplate="Trend: %{y:$,.0f}<br>%{x|%Y-%m-%d}<extra></extra>",
-))
-
-# 5. Halving vertical lines
-for d_str, lbl in halving_list:
-    dt = pd.to_datetime(d_str)
-    if chart_start <= dt <= chart_end:
-        fig.add_vline(x=dt, line=dict(color="purple", dash="dash", width=1.4),
-                      opacity=0.6,
-                      annotation_text=lbl, annotation_position="top",
-                      annotation_font=dict(color="purple", size=9))
-
-# 6. Present line
-fig.add_vline(x=last_date, line=dict(color="gray", dash="dot", width=2.5),
-              annotation_text="Present", annotation_position="top right",
-              annotation_font=dict(color="gray", size=10))
-
-# 7. CAGR annotations
-for i in range(len(halving_list) - 1):
-    s  = pd.to_datetime(halving_list[i][0])
-    e  = pd.to_datetime(halving_list[i + 1][0])
-    t1 = (s - genesis).total_seconds() / (24 * 3600 * 365.25)
-    t2 = (e - genesis).total_seconds() / (24 * 3600 * 365.25)
-    p1 = 10 ** (a + b * np.log(t1))
-    p2 = 10 ** (a + b * np.log(t2))
-    cagr = (p2 / p1) ** (1 / (t2 - t1)) - 1
-    mid  = s + (e - s) / 2
-    cycle_name = f"{halving_list[i][0][:4]}–{halving_list[i+1][0][:4]}"
-    fig.add_annotation(
-        x=mid, y=np.log10(500),
-        text=f"<b>{cycle_name}</b><br>{cagr*100:.1f}% CAGR",
-        showarrow=False, font=dict(color="purple", size=9),
-        bgcolor="white", bordercolor="purple", borderwidth=1, borderpad=4,
-        yref="y",
+    # Support channel
+    ax.fill_between(
+        proj_dates, p_support, p_proj,
+        color=SUPPORT_COLOR, alpha=0.15, lw=0, zorder=1,
+        label=f"Support channel ({int(support_discount * 100)}% below model)",
     )
 
-# 8. Historical ATH markers
-fig.add_trace(go.Scatter(
-    x=hist_aths["timestamp"], y=hist_aths["price"],
-    mode="markers+text",
-    marker=dict(symbol="star", size=16, color="gold", line=dict(color="darkred", width=1.5)),
-    text=[plabel(p) for p in hist_aths["price"]],
-    textposition="top center",
-    textfont=dict(color="darkred", size=9),
-    name="Historical ATH",
-    hovertemplate="<b>ATH</b><br>Date: %{x|%Y-%m-%d}<br>Price: %{y:$,.0f}<extra></extra>",
-))
+    # Model line
+    ax.plot(proj_dates, p_proj, linestyle="--", color=MODEL_COLOR, linewidth=1.2,
+            zorder=3, label="Power-law staircase model")
 
-# 9. Historical Cycle Low markers
-fig.add_trace(go.Scatter(
-    x=hist_lows["timestamp"], y=hist_lows["price"],
-    mode="markers+text",
-    marker=dict(symbol="triangle-down", size=12, color="limegreen",
-                line=dict(color="darkgreen", width=1.4)),
-    text=[plabel(p) for p in hist_lows["price"]],
-    textposition="bottom center",
-    textfont=dict(color="darkgreen", size=9),
-    name="Historical Cycle Low",
-    hovertemplate="<b>Cycle Low</b><br>Date: %{x|%Y-%m-%d}<br>Price: %{y:$,.0f}<extra></extra>",
-))
+    # Actual price
+    ax.plot(hist.index, hist["Close"].values, color=ACTUAL_COLOR, linewidth=1.5,
+            zorder=4, label="BTC-USD (actual)")
 
-# 10. Future ATH markers
-if not fut_aths.empty:
-    fig.add_trace(go.Scatter(
-        x=fut_aths["timestamp"], y=fut_aths["pred_price"],
-        mode="markers+text",
-        marker=dict(symbol="star", size=18, color="gold", line=dict(color="darkred", width=1.5)),
-        text=[plabel(p) for p in fut_aths["pred_price"]],
-        textposition="top center",
-        textfont=dict(color="darkred", size=9),
-        name="Predicted ATH",
-        hovertemplate="<b>Predicted ATH</b><br>Date: %{x|%Y-%m-%d}<br>Model: %{y:$,.0f}<extra></extra>",
-    ))
+    # Ceiling
+    ax.axhline(PRICE_CEILING, color="#444444", linestyle=":", linewidth=1.0, zorder=2)
+    ax.text(PROJECTION_START, PRICE_CEILING * 1.15,
+            f"$10T market-cap ceiling (~{fmt_price(PRICE_CEILING)}/BTC)",
+            fontsize=9, color="#444444", va="bottom", ha="left")
 
-# 11. Future Cycle Low markers
-if not fut_lows.empty:
-    fig.add_trace(go.Scatter(
-        x=fut_lows["timestamp"], y=fut_lows["pred_price"],
-        mode="markers+text",
-        marker=dict(symbol="triangle-down", size=14, color="limegreen",
-                    line=dict(color="darkgreen", width=1.4)),
-        text=[plabel(p) for p in fut_lows["pred_price"]],
-        textposition="bottom center",
-        textfont=dict(color="darkgreen", size=9),
-        name="Predicted Cycle Low",
-        hovertemplate="<b>Predicted Low</b><br>Date: %{x|%Y-%m-%d}<br>Model: %{y:$,.0f}<extra></extra>",
-    ))
+    # CAGR markers and kickoff arrows
+    for name, s, e in phases:
+        years = e - s
+        if years < 0.25:
+            continue
+        p_s = float(model_price(s, params))
+        p_e = float(model_price(e, params))
+        cagr = annualized_cagr(p_s, p_e, years)
+        mid = (s + e) / 2.0
+        seg_t = np.linspace(s, e, 50)
+        y_top = float(np.max(model_price(seg_t, params))) * (2.6 if name == "Consolidation" else 4.0)
+        y_top = min(y_top, PRICE_CEILING * 12)
+        if np.isfinite(cagr):
+            ax.text(t_to_date(mid), y_top, f"{cagr * 100:+.0f}% CAGR",
+                    color=CAGR_COLOR, fontsize=9, fontweight="bold",
+                    ha="center", va="bottom", zorder=6)
 
-# 12. Live price marker
-if live_price:
-    fig.add_trace(go.Scatter(
-        x=[live_ts], y=[live_price],
-        mode="markers",
-        marker=dict(symbol="circle", size=12, color="crimson", line=dict(color="white", width=2)),
-        name=f"Live: {plabel(live_price)}",
-        hovertemplate=f"<b>Live BTC</b><br>{plabel(live_price)}<extra></extra>",
-    ))
+        if name == "Expansion":
+            kickoff_date = t_to_date(s)
+            ax.plot([kickoff_date], [p_s], marker="^", markersize=14, linestyle="none",
+                    markerfacecolor="none", markeredgecolor=ARROW_COLOR, markeredgewidth=1.8,
+                    zorder=7)
+            ax.annotate(
+                f"{kickoff_date.strftime('%b %Y')}\ntarget {fmt_price(p_e)}",
+                xy=(kickoff_date, p_s),
+                xytext=(10, -42), textcoords="offset points",
+                fontsize=8, color=ARROW_COLOR, ha="left", va="top", zorder=7,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=ARROW_COLOR, alpha=0.85, lw=0.8),
+            )
 
-# ── Layout ────────────────────────────────────────────────────────────────────
-eq_str = (
-    f"log₁₀(P) = {a:.3f} + {b:.3f}·ln(t) + {A:.3f}·e^(−{gamma:.4f}t)·sin({omega:.4f}t + {phi:.4f})"
-)
-fig.update_layout(
-    title=dict(
-        text="Bitcoin Damped-Oscillator Model — Full Cycle History & Forecast (2012–2040)",
-        font=dict(size=17),
-    ),
-    xaxis=dict(
-        range=[chart_start, chart_end],
-        title="Year",
-        showgrid=True, gridcolor="rgba(0,0,0,0.08)",
-        rangeslider=dict(visible=True, thickness=0.04),
-    ),
-    yaxis=dict(
-        type="log",
-        range=[np.log10(100), np.log10(100_000_000)],
-        title="Bitcoin Price (USD, log scale)",
-        showgrid=True, gridcolor="rgba(0,0,0,0.08)",
-        tickformat="$,.0f",
-        tickvals=[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000],
-        ticktext=["$100", "$1K", "$10K", "$100K", "$1M", "$10M", "$100M"],
-    ),
-    hovermode="x unified",
-    legend=dict(
-        orientation="v", x=1.01, y=1,
-        bgcolor="rgba(255,255,255,0.9)",
-        bordercolor="#ccc", borderwidth=1,
-        font=dict(size=10),
-    ),
-    height=750,
-    margin=dict(l=70, r=180, t=70, b=80),
-    annotations=[
-        dict(
-            text=eq_str,
-            xref="paper", yref="paper",
-            x=0.01, y=0.99,
-            showarrow=False,
-            font=dict(size=10, family="monospace"),
-            bgcolor="white", bordercolor="#1f77b4", borderwidth=1, borderpad=6,
-            align="left",
+    # Axes formatting
+    ax.set_yscale("log")
+    ax.yaxis.set_major_locator(mticker.LogLocator(base=10.0, numticks=12))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(currency_tick))
+    ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+
+    y_min = max(1.0, float(hist["Close"].min()) / 3.0)
+    ax.set_ylim(y_min, PRICE_CEILING * 25)
+    ax.set_xlim(PROJECTION_START, PROJECTION_END)
+
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.xaxis.set_minor_locator(mdates.YearLocator(1))
+
+    ax.grid(True, which="major", axis="y", color="#dddddd", linewidth=0.8)
+    ax.grid(True, which="minor", axis="y", color="#f0f0f0", linewidth=0.5)
+    ax.grid(True, which="major", axis="x", color="#eeeeee", linewidth=0.6)
+
+    ax.set_title("Bitcoin Power-Law Underdamped Staircase & Macro Oscillator (2012 to 2040)",
+                 fontsize=15, fontweight="bold", pad=14)
+    ax.set_xlabel("Year", fontsize=11)
+    ax.set_ylabel("BTC-USD (log scale)", fontsize=11)
+
+    # Legend
+    handles, labels = ax.get_legend_handles_labels()
+    handles += [
+        Patch(facecolor=CONSOLIDATION_COLOR, alpha=0.25, label="Consolidation epoch"),
+        Patch(facecolor=EXPANSION_COLOR, alpha=0.4, label="Expansion epoch"),
+        Line2D([0], [0], marker="^", color="none", markerfacecolor="none",
+               markeredgecolor=ARROW_COLOR, markersize=11, markeredgewidth=1.6,
+               label="Expansion kickoff"),
+        Line2D([0], [0], color=CAGR_COLOR, lw=0, marker="$\\%$", markersize=9,
+               label="Annualized CAGR"),
+    ]
+    ax.legend(handles=handles, loc="upper left", fontsize=9, framealpha=0.92)
+
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    return fig
+
+
+def build_phase_table(params, phases: list) -> pd.DataFrame:
+    rows = []
+    for name, s, e in phases:
+        years = e - s
+        p_s = float(model_price(s, params))
+        p_e = float(model_price(e, params))
+        cagr = annualized_cagr(p_s, p_e, years)
+        rows.append({
+            "Phase": name,
+            "Start Date": t_to_date(s).strftime("%Y-%m-%d"),
+            "End Date": t_to_date(e).strftime("%Y-%m-%d"),
+            "Duration (yrs)": f"{years:.2f}",
+            "Start Price": fmt_price(p_s),
+            "End Price": fmt_price(p_e),
+            "Annualized CAGR": f"{cagr * 100:+.1f}%" if np.isfinite(cagr) else "n/a",
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
+def main():
+    st.set_page_config(
+        page_title="BTC Power-Law Staircase Model",
+        page_icon="₿",
+        layout="wide",
+    )
+
+    st.markdown(
+        """
+        <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            header {visibility: hidden;}
+            .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+            .metric-note {color: #666; font-size: 0.85rem;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("Bitcoin Power-Law Underdamped Staircase & Macro Oscillator")
+    st.caption(
+        "Log-log power-law trend + sigmoid halving staircase + underdamped decay wobble, "
+        "capped at a $10T market cap. Data: Yahoo Finance (BTC-USD, daily)."
+    )
+
+    # ---- Data ----
+    with st.spinner("Fetching BTC-USD history from Yahoo Finance..."):
+        try:
+            hist = load_btc_history()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Data download failed: {exc}")
+            st.stop()
+
+    if hist is None or hist.empty or len(hist) < 100:
+        st.error("No usable BTC-USD price data was returned. Check network access and try again.")
+        st.stop()
+
+    t_hist = dates_to_t(hist.index)
+    y_hist = np.log10(hist["Close"].values.astype(float))
+
+    if not np.all(np.isfinite(y_hist)):
+        mask = np.isfinite(y_hist)
+        hist, t_hist, y_hist = hist[mask], t_hist[mask], y_hist[mask]
+        if hist.empty:
+            st.error("All price observations were invalid after cleaning.")
+            st.stop()
+
+    # ---- Fit ----
+    fitted, fit_ok, fit_msg = fit_model(t_hist, y_hist)
+
+    # ---- Sidebar ----
+    st.sidebar.header("Model Controls")
+    use_fitted = st.sidebar.checkbox("Use fitted parameters", value=True)
+
+    if use_fitted:
+        params = np.array(fitted, dtype=float)
+    else:
+        st.sidebar.markdown("Manual overrides (bounded to fit ranges):")
+        params = []
+        labels = {
+            "a": "a (trend intercept)",
+            "b": "b (power-law exponent)",
+            "step_h": "step_h (log10 step height)",
+            "step_f": "step_f (step period, yrs)",
+            "sharp": "sharp (breakout sharpness)",
+            "amp": "amp (wobble amplitude)",
+            "decay": "decay (wobble decay)",
+        }
+        for i, name in enumerate(PARAM_NAMES):
+            lo, hi = float(LOWER_BOUNDS[i]), float(UPPER_BOUNDS[i])
+            default = float(np.clip(fitted[i], lo, hi))
+            params.append(st.sidebar.slider(labels[name], lo, hi, default, step=(hi - lo) / 200.0))
+        params = np.array(params, dtype=float)
+
+    st.sidebar.markdown("---")
+    support_discount = st.sidebar.slider("Support channel discount", 0.05, 0.60, 0.30, 0.05,
+                                         format="%.2f")
+    expansion_frac = st.sidebar.slider("Expansion share of cycle", 0.10, 0.40, 0.20, 0.05,
+                                       format="%.2f")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Fitted parameters**")
+    st.sidebar.dataframe(
+        pd.DataFrame({"param": PARAM_NAMES, "value": [f"{v:.4f}" for v in fitted]}),
+        hide_index=True,
+    )
+    if fit_ok:
+        st.sidebar.success(fit_msg)
+    else:
+        st.sidebar.warning(fit_msg)
+
+    # ---- Metrics ----
+    q = fit_quality(t_hist, y_hist, params)
+    last_date = hist.index[-1]
+    last_price = float(hist["Close"].iloc[-1])
+    model_now = float(model_price(t_hist[-1], params))
+    deviation = last_price / model_now - 1.0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Last close", fmt_price(last_price), last_date.strftime("%Y-%m-%d"))
+    c2.metric("Model fair value", fmt_price(model_now), f"{deviation * 100:+.1f}% actual vs model")
+    c3.metric("Support floor", fmt_price(model_now * (1 - support_discount)))
+    c4.metric("Fit R² (log10)", f"{q['r2']:.3f}")
+    c5.metric("Fit RMSE (log10)", f"{q['rmse_log10']:.3f}")
+
+    # ---- Chart ----
+    t_start = float(dates_to_t(pd.DatetimeIndex([PROJECTION_START]))[0])
+    t_end = float(dates_to_t(pd.DatetimeIndex([PROJECTION_END]))[0])
+    phases = build_phases(params, t_start, t_end, expansion_frac)
+
+    fig = build_figure(hist, params, support_discount, phases)
+    st.pyplot(fig, clear_figure=True)
+    plt.close(fig)
+
+    # ---- Phase table ----
+    st.subheader("Audited Macro Cycles")
+    st.markdown(
+        "Each row is one epoch of the model. Expansion epochs are centred on the sigmoid "
+        "breakout of the staircase; consolidation epochs fill the remainder of each step period. "
+        "Prices are model values, not actuals."
+    )
+    table = build_phase_table(params, phases)
+    st.dataframe(table, hide_index=True)
+
+    # ---- Model definition ----
+    with st.expander("Model definition"):
+        st.latex(r"\log_{10} P(t) = \min\Big(\text{Trend}(t) + \text{Staircase}(t) + \text{Wobble}(t),\ \log_{10}(\text{CEILING})\Big)")
+        st.latex(r"\text{Trend}(t) = a + b \cdot \log_{10}(t)")
+        st.latex(r"\text{Staircase}(t) = \text{step\_h}\left(\left\lfloor \tfrac{t}{\text{step\_f}} \right\rfloor + \frac{1}{1 + e^{-\text{sharp}\,(t \bmod \text{step\_f} - \text{step\_f}/2)}}\right)")
+        st.latex(r"\text{Wobble}(t) = \text{amp} \cdot e^{-\text{decay}\,(t \bmod \text{step\_f})} \cdot \sin\!\left(2\pi \frac{t \bmod \text{step\_f}}{\text{step\_f}}\right)")
+        st.markdown(
+            f"- $t$ is fractional years since Genesis ({GENESIS.date()}), floored at {EPS:g}.\n"
+            f"- CEILING = $10T / {CIRCULATING_SUPPLY:,} BTC = {fmt_price(PRICE_CEILING)} per BTC.\n"
+            f"- Fit bounds: lower {LOWER_BOUNDS}, upper {UPPER_BOUNDS}."
         )
-    ],
-    plot_bgcolor="white",
-    paper_bgcolor="white",
-)
 
-st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"Rendered {datetime.now().strftime('%Y-%m-%d %H:%M')}. "
+        "This is a curve-fitting exercise for illustration, not investment advice."
+    )
 
-live_str = plabel(live_price) if live_price else "unavailable"
-st.caption(
-    f"Live price: {live_str}  ·  Last data: {last_date.date()}  ·  "
-    f"Cycle ≈ {2*np.pi/omega:.2f} yr  ·  Auto-refreshes every 60 s  ·  "
-    "Drag to zoom · scroll to zoom price · double-click to reset"
-)
+
+if __name__ == "__main__":
+    main()
